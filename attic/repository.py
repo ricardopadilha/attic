@@ -28,7 +28,7 @@ class Repository(object):
     dir/index.X
     dir/hints.X
     """
-    DEFAULT_MAX_SEGMENT_SIZE = 5 * 1024 * 1024
+    DEFAULT_MAX_SEGMENT_SIZE = 10 * 1024 * 1024
     DEFAULT_SEGMENTS_PER_DIR = 10000
 
     class DoesNotExist(Error):
