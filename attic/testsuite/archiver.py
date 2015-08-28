@@ -16,6 +16,7 @@ from attic.archiver import Archiver
 from attic.cache import Cache
 from attic.crypto import bytes_to_long, num_aes_blocks
 from attic.helpers import Manifest
+from attic.key import parser
 from attic.remote import RemoteRepository, PathNotAllowed
 from attic.repository import Repository
 from attic.testsuite import AtticTestCase
@@ -271,6 +272,25 @@ class ArchiverTestCase(ArchiverTestCaseBase):
         self.assert_not_in('..', output)
         self.assert_in(' input/dir1/dir2/file', output)
 
+    def test_exclude_normalization(self):
+        self.attic('init', self.repository_location)
+        self.create_regular_file('file1', size=1024 * 80)
+        self.create_regular_file('file2', size=1024 * 80)
+        with changedir('input'):
+            self.attic('create', '--exclude=file1', self.repository_location + '::test1', '.')
+        with changedir('output'):
+            self.attic('extract', self.repository_location + '::test1')
+        self.assert_equal(sorted(os.listdir('output')), ['file2'])
+        with changedir('input'):
+            self.attic('create', '--exclude=./file1', self.repository_location + '::test2', '.')
+        with changedir('output'):
+            self.attic('extract', self.repository_location + '::test2')
+        self.assert_equal(sorted(os.listdir('output')), ['file2'])
+        self.attic('create', '--exclude=input/./file1', self.repository_location + '::test3', 'input')
+        with changedir('output'):
+            self.attic('extract', self.repository_location + '::test3')
+        self.assert_equal(sorted(os.listdir('output/input')), ['file2'])
+
     def test_repeated_files(self):
         self.create_regular_file('file1', size=1024 * 80)
         self.attic('init', self.repository_location)
@@ -413,8 +433,9 @@ class ArchiverTestCase(ArchiverTestCaseBase):
                 hash = sha256(data).digest()
                 if not hash in seen:
                     seen.add(hash)
-                    num_blocks = num_aes_blocks(len(data) - 41)
-                    nonce = bytes_to_long(data[33:41])
+                    meta, data, _, _, _, _ = parser(data)
+                    num_blocks = num_aes_blocks(len(data))
+                    nonce = bytes_to_long(meta.stored_iv)
                     for counter in range(nonce, nonce + num_blocks):
                         self.assert_not_in(counter, used)
                         used.add(counter)

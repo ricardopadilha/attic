@@ -233,11 +233,14 @@ class Archive:
         cache.rollback()
         return stats
 
-    def extract_item(self, item, restore_attrs=True, dry_run=False):
-        if dry_run:
+    def extract_item(self, item, restore_attrs=True, dry_run=False, stdout=False):
+        if dry_run or stdout:
             if b'chunks' in item:
-                for _ in self.pipeline.fetch_many([c[0] for c in item[b'chunks']], is_preloaded=True):
-                    pass
+                for data in self.pipeline.fetch_many([c[0] for c in item[b'chunks']], is_preloaded=True):
+                    if stdout:
+                        sys.stdout.buffer.write(data)
+                if stdout:
+                    sys.stdout.buffer.flush()
             return
 
         dest = self.cwd
@@ -384,6 +387,23 @@ class Archive:
         source = os.readlink(path)
         item = {b'path': make_path_safe(path), b'source': source}
         item.update(self.stat_attrs(st, path))
+        self.add_item(item)
+
+    def process_stdin(self, path, cache):
+        uid, gid = 0, 0
+        fd = sys.stdin.buffer  # binary
+        chunks = []
+        for chunk in self.chunker.chunkify(fd):
+            chunks.append(cache.add_chunk(self.key.id_hash(chunk), chunk, self.stats))
+        self.stats.nfiles += 1
+        item = {
+            b'path': path,
+            b'chunks': chunks,
+            b'mode': 0o100660,  # regular file, ug=rw
+            b'uid': uid, b'user': uid2user(uid),
+            b'gid': gid, b'group': gid2group(gid),
+            b'mtime': int_to_bigint(int(time.time()) * 1000000000)
+        }
         self.add_item(item)
 
     def process_file(self, path, st, cache):
@@ -534,7 +554,7 @@ class ArchiveChecker:
     def __del__(self):
         shutil.rmtree(self.tmpdir)
 
-    def check(self, repository, repair=False):
+    def check(self, repository, repair=False, last=None):
         self.report_progress('Starting archive consistency check...')
         self.repair = repair
         self.repository = repository
@@ -544,8 +564,11 @@ class ArchiveChecker:
             self.manifest = self.rebuild_manifest()
         else:
             self.manifest, _ = Manifest.load(repository, key=self.key)
-        self.rebuild_refcounts()
-        self.verify_chunks()
+        self.rebuild_refcounts(last=last)
+        if last is None:
+            self.verify_chunks()
+        else:
+            self.report_progress('Orphaned objects check skipped (needs all archives checked)')
         if not self.error_found:
             self.report_progress('Archive consistency check complete, no problems found.')
         return self.repair or not self.error_found
@@ -600,7 +623,7 @@ class ArchiveChecker:
         self.report_progress('Manifest rebuild complete', error=True)
         return manifest
 
-    def rebuild_refcounts(self):
+    def rebuild_refcounts(self, last=None):
         """Rebuild object reference counts by walking the metadata
 
         Missing and/or incorrect data is repaired when detected
@@ -677,8 +700,11 @@ class ArchiveChecker:
 
         repository = cache_if_remote(self.repository)
         num_archives = len(self.manifest.archives)
-        for i, (name, info) in enumerate(list(self.manifest.archives.items()), 1):
-            self.report_progress('Analyzing archive {} ({}/{})'.format(name, i, num_archives))
+        archive_items = sorted(self.manifest.archives.items(), reverse=True,
+                               key=lambda name_info: name_info[1][b'time'])
+        end = None if last is None else min(num_archives, last)
+        for i, (name, info) in enumerate(archive_items[:end]):
+            self.report_progress('Analyzing archive {} ({}/{})'.format(name, num_archives - i, num_archives))
             archive_id = info[b'id']
             if not archive_id in self.chunks:
                 self.report_progress('Archive metadata block is missing', error=True)

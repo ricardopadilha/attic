@@ -22,8 +22,23 @@ class ConnectionClosed(Error):
 class PathNotAllowed(Error):
     """Repository path not allowed"""
 
+class InvalidRPCMethod(Error):
+    """RPC method is not valid"""
 
 class RepositoryServer(object):
+    rpc_methods = (
+            '__len__',
+            'check',
+            'commit',
+            'delete',
+            'get',
+            'list',
+            'negotiate',
+            'open',
+            'put',
+            'repair',
+            'rollback',
+            )
 
     def __init__(self, restrict_to_paths):
         self.repository = None
@@ -46,9 +61,14 @@ class RepositoryServer(object):
                 if not data:
                     return
                 unpacker.feed(data)
-                for type, msgid, method, args in unpacker:
+                for unpacked in unpacker:
+                    if not (isinstance(unpacked, tuple) and len(unpacked) == 4):
+                        raise Exception("Unexpected RPC data format.")
+                    type, msgid, method, args = unpacked
                     method = method.decode('ascii')
                     try:
+                        if not method in self.rpc_methods:
+                            raise InvalidRPCMethod(method)
                         try:
                             f = getattr(self, method)
                         except AttributeError:
@@ -156,8 +176,10 @@ class RemoteRepository(object):
                             raise IntegrityError(res)
                         elif error == b'PathNotAllowed':
                             raise PathNotAllowed(*res)
-                        if error == b'ObjectNotFound':
+                        elif error == b'ObjectNotFound':
                             raise Repository.ObjectNotFound(res[0], self.location.orig)
+                        elif error == b'InvalidRPCMethod':
+                            raise InvalidRPCMethod(*res)
                         raise self.RPCError(error)
                     else:
                         yield res
@@ -173,7 +195,10 @@ class RemoteRepository(object):
                 if not data:
                     raise ConnectionClosed()
                 self.unpacker.feed(data)
-                for type, msgid, error, res in self.unpacker:
+                for unpacked in self.unpacker:
+                    if not (isinstance(unpacked, tuple) and len(unpacked) == 4):
+                        raise Exception("Unexpected RPC data format.")
+                    type, msgid, error, res = unpacked
                     if msgid in self.ignore_responses:
                         self.ignore_responses.remove(msgid)
                     else:

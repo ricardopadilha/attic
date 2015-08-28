@@ -13,7 +13,7 @@ from attic import __version__
 from attic.archive import Archive, ArchiveChecker
 from attic.repository import Repository
 from attic.cache import Cache
-from attic.key import key_creator
+from attic.key import key_creator, COMPR_DEFAULT, HASH_DEFAULT, MAC_DEFAULT, PLAIN_DEFAULT, CIPHER_DEFAULT
 from attic.helpers import Error, location_validator, format_time, \
     format_file_mode, ExcludePattern, exclude_path, adjust_patterns, to_localtime, \
     get_cache_dir, get_keys_dir, format_timedelta, prune_within, prune_split, \
@@ -59,7 +59,6 @@ class Archiver:
         repository = self.open_repository(args.repository, create=True, exclusive=True)
         key = key_creator(repository, args)
         manifest = Manifest(key, repository)
-        manifest.key = key
         manifest.write()
         repository.commit()
         Cache(repository, key, manifest, warn_if_unencrypted=False)
@@ -82,7 +81,7 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
                 print('Repository check complete, no problems found.')
             else:
                 return 1
-        if not args.repo_only and not ArchiveChecker().check(repository, repair=args.repair):
+        if not args.repo_only and not ArchiveChecker().check(repository, repair=args.repair, last=args.last):
                 return 1
         return 0
 
@@ -98,7 +97,7 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
         t0 = datetime.now()
         repository = self.open_repository(args.archive, exclusive=True)
         manifest, key = Manifest.load(repository)
-        cache = Cache(repository, key, manifest)
+        cache = Cache(repository, key, manifest, do_files=args.cache_files)
         archive = Archive(repository, key, manifest, args.archive.archive, cache=cache,
                           create=True, checkpoint_interval=args.checkpoint_interval,
                           numeric_owner=args.numeric_owner)
@@ -117,6 +116,14 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
             except IOError:
                 pass
         for path in args.paths:
+            if path == '-':  # stdin
+                path = 'stdin'
+                self.print_verbose(path)
+                try:
+                    archive.process_stdin(path, cache)
+                except IOError as e:
+                    self.print_error('%s: %s', path, e)
+                continue
             path = os.path.normpath(path)
             if args.dontcross:
                 try:
@@ -174,8 +181,9 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
                 self.print_error('%s: %s', path, e)
             else:
                 for filename in sorted(entries):
+                    entry_path = os.path.normpath(os.path.join(path, filename))
                     self._process(archive, cache, excludes, exclude_caches, skip_inodes,
-                                  os.path.join(path, filename), restrict_dev)
+                                  entry_path, restrict_dev)
         elif stat.S_ISLNK(st.st_mode):
             archive.process_symlink(path, st)
         elif stat.S_ISFIFO(st.st_mode):
@@ -197,6 +205,7 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
                           numeric_owner=args.numeric_owner)
         patterns = adjust_patterns(args.paths, args.excludes)
         dry_run = args.dry_run
+        stdout = args.stdout
         strip_components = args.strip_components
         dirs = []
         for item in archive.iter_items(lambda item: not exclude_path(item[b'path'], patterns), preload=True):
@@ -207,7 +216,7 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
                     continue
             if not args.dry_run:
                 while dirs and not item[b'path'].startswith(dirs[-1][b'path']):
-                    archive.extract_item(dirs.pop(-1))
+                    archive.extract_item(dirs.pop(-1), stdout=stdout)
             self.print_verbose(remove_surrogates(orig_path))
             try:
                 if dry_run:
@@ -217,7 +226,7 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
                         dirs.append(item)
                         archive.extract_item(item, restore_attrs=False)
                     else:
-                        archive.extract_item(item)
+                        archive.extract_item(item, stdout=stdout)
             except IOError as e:
                 self.print_error('%s: %s', remove_surrogates(orig_path), e)
 
@@ -230,7 +239,7 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
         """Delete an existing archive"""
         repository = self.open_repository(args.archive, exclusive=True)
         manifest, key = Manifest.load(repository)
-        cache = Cache(repository, key, manifest)
+        cache = Cache(repository, key, manifest, do_files=args.cache_files)
         archive = Archive(repository, key, manifest, args.archive.archive, cache=cache)
         stats = Statistics()
         archive.delete(stats)
@@ -284,7 +293,11 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
                         size = sum(size for _, size, _ in item[b'chunks'])
                     except KeyError:
                         pass
-                mtime = format_time(datetime.fromtimestamp(bigint_to_int(item[b'mtime']) / 1e9))
+                try:
+                    mtime = datetime.fromtimestamp(bigint_to_int(item[b'mtime']) / 1e9)
+                except ValueError:
+                    # likely a broken mtime and datetime did not want to go beyond year 9999
+                    mtime = datetime(9999, 12, 31, 23, 59, 59)
                 if b'source' in item:
                     if type == 'l':
                         extra = ' -> %s' % item[b'source']
@@ -294,7 +307,7 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
                 else:
                     extra = ''
                 print('%s%s %-6s %-6s %8d %s %s%s' % (type, mode, item[b'user'] or item[b'uid'],
-                                                  item[b'group'] or item[b'gid'], size, mtime,
+                                                  item[b'group'] or item[b'gid'], size, format_time(mtime),
                                                   remove_surrogates(item[b'path']), extra))
         else:
             for archive in sorted(Archive.list_archives(repository, key, manifest), key=attrgetter('ts')):
@@ -305,7 +318,7 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
         """Show archive details such as disk space used"""
         repository = self.open_repository(args.archive)
         manifest, key = Manifest.load(repository)
-        cache = Cache(repository, key, manifest)
+        cache = Cache(repository, key, manifest, do_files=args.cache_files)
         archive = Archive(repository, key, manifest, args.archive.archive, cache=cache)
         stats = archive.calc_stats(cache)
         print('Name:', archive.name)
@@ -322,7 +335,7 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
         """Prune repository archives according to specified rules"""
         repository = self.open_repository(args.repository, exclusive=True)
         manifest, key = Manifest.load(repository)
-        cache = Cache(repository, key, manifest)
+        cache = Cache(repository, key, manifest, do_files=args.cache_files)
         archives = list(sorted(Archive.list_archives(repository, key, manifest, cache),
                                key=attrgetter('ts'), reverse=True))
         if args.hourly + args.daily + args.weekly + args.monthly + args.yearly == 0 and args.within is None:
@@ -450,6 +463,9 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
         common_parser.add_argument('-v', '--verbose', dest='verbose', action='store_true',
                             default=False,
                             help='verbose output')
+        common_parser.add_argument('--no-files-cache', dest='cache_files', action='store_false',
+                            default=True,
+                            help='do not use the "files" cache')
 
         # We can't use argparse for "serve" since we don't want it to show up in "Available commands"
         if args:
@@ -466,8 +482,28 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
         init_epilog = textwrap.dedent("""
         This command initializes an empty repository. A repository is a filesystem
         directory containing the deduplicated data from zero or more archives.
-        Encryption can be enabled at repository init time.
-        """)
+        Encryption can be enabled, compression and mac method can be chosen at
+        repository init time.
+
+        --compression METHODs (default: %02d):
+
+        - 00..09  zlib levels 0..9 (0 means no compression, 9 max. compression)
+        - 10..19  lzma levels 0..9 (0 means no compression, 9 max. compression)
+
+        --cipher METHODs (default: %02d or %02d)
+
+        - 00      No encryption
+        - 01      AEAD: AES-CTR + HMAC-SHA256
+        - 02      AEAD: AES-GCM
+
+        --mac METHODs (default: %02d or %02d):
+
+        - 00      sha256 (just simple hash, no MAC, faster on 32bit CPU)
+        - 01      sha512-256 (just simple hash, no MAC, faster on 64bit CPU)
+        - 10      hmac-sha256 (HMAC, faster on 32bit CPU)
+        - 11      hmac-sha512-256 (HMAC, faster on 64bit CPU)
+        - 20      gmac (MAC, fastest on CPUs with AES-GCM HW support)
+        """ % (COMPR_DEFAULT, PLAIN_DEFAULT, CIPHER_DEFAULT, HASH_DEFAULT, MAC_DEFAULT))
         subparser = subparsers.add_parser('init', parents=[common_parser],
                                           description=self.do_init.__doc__, epilog=init_epilog,
                                           formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -478,6 +514,15 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
         subparser.add_argument('-e', '--encryption', dest='encryption',
                                choices=('none', 'passphrase', 'keyfile'), default='none',
                                help='select encryption method')
+        subparser.add_argument('-C', '--cipher', dest='cipher',
+                               type=int, default=None, metavar='METHOD',
+                               help='select cipher (0..2)')
+        subparser.add_argument('-c', '--compression', dest='compression',
+                               type=int, default=COMPR_DEFAULT, metavar='METHOD',
+                               help='select compression method (0..19)')
+        subparser.add_argument('-m', '--mac', dest='mac',
+                               type=int, default=None, metavar='METHOD',
+                               help='select hash/mac method (0..3)')
 
         check_epilog = textwrap.dedent("""
         The check command verifies the consistency of a repository and the corresponding
@@ -506,6 +551,9 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
         subparser.add_argument('--repair', dest='repair', action='store_true',
                                default=False,
                                help='attempt to repair any inconsistencies found')
+        subparser.add_argument('--last', dest='last',
+                               type=int, default=None, metavar='N',
+                               help='only check last N archives (Default: all)')
 
         change_passphrase_epilog = textwrap.dedent("""
         The key files used for repository encryption are optionally passphrase
@@ -587,6 +635,9 @@ Type "Yes I am sure" if you understand this and want to continue.\n""")
         subparser.add_argument('--strip-components', dest='strip_components',
                                type=int, default=0, metavar='NUMBER',
                                help='Remove the specified number of leading path elements. Pathnames with fewer elements will be silently skipped.')
+        subparser.add_argument('--stdout', dest='stdout',
+                               action='store_true', default=False,
+                               help='write all extracted data to stdout')
         subparser.add_argument('archive', metavar='ARCHIVE',
                                type=location_validator(archive=True),
                                help='archive to extract')

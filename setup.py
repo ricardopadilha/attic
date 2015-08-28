@@ -94,6 +94,12 @@ elif sys.platform.startswith('freebsd'):
 elif sys.platform == 'darwin':
     ext_modules.append(Extension('attic.platform_darwin', [platform_darwin_source]))
 
+# msgpack pure python data corruption was fixed in 0.4.6.
+# Also, we might use some rather recent API features.
+install_requires=['msgpack-python>=0.4.6']
+if sys.version_info < (3, 3):
+    install_requires.append('backports.lzma')
+
 setup(
     name='Attic',
     version=versioneer.get_version(),
@@ -120,5 +126,5 @@ setup(
     scripts=['scripts/attic'],
     cmdclass=cmdclass,
     ext_modules=ext_modules,
-    install_requires=['msgpack-python']
+    install_requires=install_requires,
 )
